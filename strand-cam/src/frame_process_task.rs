@@ -44,6 +44,123 @@ use crate::{
     video_streaming,
 };
 
+/// One unit of chessboard-detection work, handed off to a blocking-pool
+/// thread. Cloning is a cheap `Arc` bump (the image) plus a couple of small
+/// copies, so a fresh job can always be built and submitted without waiting
+/// on whatever job the worker is currently processing.
+#[cfg(feature = "checkercal")]
+#[derive(Clone)]
+struct CheckerboardJob {
+    image: Arc<strand_dynamic_frame::DynamicFrameOwned>,
+    pattern_width: u32,
+    pattern_height: u32,
+    debug_dir: Option<String>,
+}
+
+/// Result of a completed [`CheckerboardJob`].
+#[cfg(feature = "checkercal")]
+struct CheckerboardJobResult {
+    corners: Option<Vec<(f32, f32)>>,
+    work_duration: std::time::Duration,
+}
+
+/// Detect a chessboard in `job.image` (and, if configured, save debug
+/// artifacts). This is CPU-bound and, on a frame with no board visible, can
+/// take anywhere from ~100 ms to tens of seconds depending on scene content
+/// -- it must therefore run via [`tokio::task::spawn_blocking`] on a
+/// blocking-pool thread, never inline in the async frame-processing loop.
+///
+/// Returns `Err` only for a bad frame (e.g. an unsupported pixel format);
+/// the caller logs and discards such an error rather than letting it end the
+/// worker task.
+#[cfg(feature = "checkercal")]
+fn run_checkerboard_job(job: CheckerboardJob) -> Result<CheckerboardJobResult> {
+    let debug_image_stamp: chrono::DateTime<chrono::Local> = chrono::Local::now();
+
+    if let Some(debug_dir) = &job.debug_dir {
+        let format_str = format!(
+            "input_{}_{}_%Y%m%d_%H%M%S.png",
+            job.pattern_width, job.pattern_height
+        );
+        let stamped = debug_image_stamp.format(&format_str).to_string();
+        let png_buf = job
+            .image
+            .borrow()
+            .to_encoded_buffer(convert_image::EncoderOptions::Png)?;
+
+        let debug_path = std::path::PathBuf::from(debug_dir);
+        let image_path = debug_path.join(stamped);
+
+        let mut f = File::create(&image_path).expect("create file");
+        std::io::Write::write_all(&mut f, &png_buf).unwrap();
+    }
+
+    info!(
+        "Attempting to find {}x{} chessboard.",
+        job.pattern_width, job.pattern_height
+    );
+
+    let start_time = std::time::Instant::now();
+    let frame_ref = job.image.borrow();
+    let corners = strand_dynamic_frame::match_all_dynamic_fmts!(
+        &frame_ref,
+        x,
+        {
+            let rgb: Box<dyn formats::ImageStride<formats::pixel_format::RGB8>> =
+                Box::new(convert_image::convert_ref::<_, formats::pixel_format::RGB8>(&x)?);
+            camcal::find_chessboard_corners(
+                rgb.image_data(),
+                rgb.width(),
+                rgb.height(),
+                job.pattern_width as usize,
+                job.pattern_height as usize,
+            )?
+        },
+        eyre::eyre!("unknown pixel format in checkerboard finder")
+    );
+    let work_duration = start_time.elapsed();
+
+    debug!("corners: {:?}", corners);
+
+    if let Some(debug_dir) = &job.debug_dir {
+        let format_str = "input_%Y%m%d_%H%M%S.yaml";
+        let stamped = debug_image_stamp.format(format_str).to_string();
+        let debug_path = std::path::PathBuf::from(debug_dir);
+        let yaml_path = debug_path.join(stamped);
+
+        let f = File::create(&yaml_path).expect("create file");
+
+        #[derive(Serialize)]
+        struct CornerData<'a> {
+            corners: &'a Option<Vec<(f32, f32)>>,
+            work_duration: std::time::Duration,
+        }
+        let debug_data = CornerData {
+            corners: &corners,
+            work_duration,
+        };
+        serde_yaml::to_writer(f, &debug_data).expect("serde_yaml::to_writer");
+    }
+
+    if let Some(ref c) = corners {
+        info!(
+            "Found {} chessboard corners in {} msec.",
+            c.len(),
+            work_duration.as_millis()
+        );
+    } else {
+        info!(
+            "Found no chessboard corners in {} msec.",
+            work_duration.as_millis()
+        );
+    }
+
+    Ok(CheckerboardJobResult {
+        corners,
+        work_duration,
+    })
+}
+
 /// Perform image analysis
 #[cfg_attr(not(target_os = "linux"), expect(clippy::extra_unused_lifetimes))]
 #[expect(
@@ -224,18 +341,56 @@ pub(crate) async fn frame_process_task<'a>(
     #[cfg(feature = "checkercal")]
     let mut last_checkerboard_detection = std::time::Instant::now();
 
-    // This limits the frequency at which the checkerboard detection routine is
-    // called. This is meant to both prevent flooding the calibration routine
-    // with many highly similar checkerboard images and also to allow the image
-    // processing thread to keep a low queue depth on incoming frames. In the
-    // current form here, however, keeping a low queue depth is dependent on the
-    // checkerboard detection function returning fairly quickly. I have observed
-    // the OpenCV routine taking ~90 seconds even though usually it takes 100
-    // msec. Thus, this requirement is not always met. We could move this
-    // checkerboard detection routine to a different thread (e.g. using a tokio
-    // work pool) to avoid this problem.
+    // This limits the frequency at which we *submit* a checkerboard detection
+    // job (mostly to avoid encoding/cloning a frame more often than the
+    // detector could possibly keep up with). Detection itself always runs on
+    // a blocking-pool thread via the mailbox set up below, so a slow
+    // detection -- even one taking tens of seconds -- can no longer stall
+    // this loop, the HTTP server, or the browser UI; it can only make the
+    // corner overlay lag behind the live video. This duration is adapted
+    // upward whenever a completed job took longer than the current interval.
     #[cfg(feature = "checkercal")]
     let mut checkerboard_loop_dur = std::time::Duration::from_millis(500);
+
+    // The most recently detected corners, shown as the overlay until a new
+    // detection completes (or comes back empty).
+    #[cfg(feature = "checkercal")]
+    let mut checkerboard_overlay_points: Vec<video_streaming::Point> = Vec::new();
+
+    // One-slot mailbox for checkerboard detection jobs. Submitting a job
+    // always replaces whatever the worker has not yet picked up (a
+    // `tokio::sync::watch` channel keeps only the latest value), so frames
+    // can never queue up behind a slow detection. The worker reports each
+    // completed job back over `checkerboard_result_rx`, which is drained
+    // (non-blockingly) each time a new frame arrives.
+    #[cfg(feature = "checkercal")]
+    let (checkerboard_job_tx, mut checkerboard_result_rx) = {
+        let (job_tx, mut job_rx) = tokio::sync::watch::channel::<Option<CheckerboardJob>>(None);
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel::<CheckerboardJobResult>(4);
+        my_runtime.spawn(async move {
+            while job_rx.changed().await.is_ok() {
+                let job = job_rx.borrow_and_update().clone();
+                let Some(job) = job else { continue };
+                let result =
+                    match tokio::task::spawn_blocking(move || run_checkerboard_job(job)).await {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(e)) => {
+                            error!("checkerboard detection failed: {e}");
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("checkerboard detection worker panicked: {e}");
+                            continue;
+                        }
+                    };
+                if result_tx.send(result).await.is_err() {
+                    // The frame-processing task has ended; nothing left to do.
+                    break;
+                }
+            }
+        });
+        (job_tx, result_rx)
+    };
 
     // let current_image_timer_arc = Arc::new(RwLock::new(std::time::Instant::now()));
 
@@ -783,135 +938,79 @@ pub(crate) async fn frame_process_task<'a>(
                 #[cfg(not(feature = "checkercal"))]
                 let checkercal_tmp: Option<()> = None;
                 let (found_points, valid_display) = if let Some(inner) = checkercal_tmp {
-                    #[cfg_attr(not(feature = "checkercal"), expect(unused_mut))]
-                    let mut results = Vec::new();
-                    #[cfg_attr(not(feature = "checkercal"), expect(clippy::let_unit_value))]
-                    let _ = inner;
+                    #[cfg(not(feature = "checkercal"))]
+                    let results = {
+                        let _ = inner;
+                        Vec::new()
+                    };
                     #[cfg(feature = "checkercal")]
-                    {
+                    let results = {
                         let (checkerboard_data, checkerboard_save_debug) = inner;
 
-                        // do not do this too often
-                        if last_checkerboard_detection.elapsed() > checkerboard_loop_dur {
-                            let debug_image_stamp: chrono::DateTime<chrono::Local> =
-                                chrono::Local::now();
-                            if let Some(debug_dir) = &checkerboard_save_debug {
-                                let format_str = format!(
-                                    "input_{}_{}_%Y%m%d_%H%M%S.png",
-                                    checkerboard_data.width, checkerboard_data.height
-                                );
-                                let stamped = debug_image_stamp.format(&format_str).to_string();
-                                let frame_ref = frame.image.borrow();
-                                let png_buf = frame_ref
-                                    .to_encoded_buffer(convert_image::EncoderOptions::Png)?;
-
-                                let debug_path = std::path::PathBuf::from(debug_dir);
-                                let image_path = debug_path.join(stamped);
-
-                                let mut f = File::create(&image_path).expect("create file");
-                                std::io::Write::write_all(&mut f, &png_buf).unwrap();
-                            }
-
-                            let start_time = std::time::Instant::now();
-
-                            info!(
-                                "Attempting to find {}x{} chessboard.",
-                                checkerboard_data.width, checkerboard_data.height
-                            );
-
-                            let frame_ref = frame.image.borrow();
-                            let corners = strand_dynamic_frame::match_all_dynamic_fmts!(
-                                &frame_ref,
-                                x,
-                                {
-                                    let rgb: Box<
-                                        dyn formats::ImageStride<formats::pixel_format::RGB8>,
-                                    > = Box::new(convert_image::convert_ref::<
-                                        _,
-                                        formats::pixel_format::RGB8,
-                                    >(&x)?);
-                                    camcal::find_chessboard_corners(
-                                        rgb.image_data(),
-                                        rgb.width(),
-                                        rgb.height(),
-                                        checkerboard_data.width as usize,
-                                        checkerboard_data.height as usize,
-                                    )?
-                                },
-                                eyre::eyre!("unknown pixel format in checkerboard finder")
-                            );
-
-                            let work_duration = start_time.elapsed();
-                            if work_duration > checkerboard_loop_dur {
+                        // Drain any detection jobs the worker has completed
+                        // since we last looked (never blocks: detection runs
+                        // on a separate blocking-pool thread) and update the
+                        // persisted overlay + collected corners.
+                        while let Ok(result) = checkerboard_result_rx.try_recv() {
+                            if result.work_duration > checkerboard_loop_dur {
                                 checkerboard_loop_dur =
-                                    work_duration + std::time::Duration::from_millis(5);
+                                    result.work_duration + std::time::Duration::from_millis(5);
                             }
-                            last_checkerboard_detection = std::time::Instant::now();
+                            match result.corners {
+                                Some(corners) => {
+                                    checkerboard_overlay_points = corners
+                                        .iter()
+                                        .map(|(x, y)| video_streaming::Point {
+                                            x: *x,
+                                            y: *y,
+                                            theta: None,
+                                            area: None,
+                                        })
+                                        .collect();
 
-                            debug!("corners: {:?}", corners);
+                                    let num_checkerboards_collected = {
+                                        let mut collected_corners =
+                                            collected_corners_arc.write().unwrap();
+                                        collected_corners.push(corners);
+                                        collected_corners.len().try_into().unwrap()
+                                    };
 
-                            if let Some(debug_dir) = &checkerboard_save_debug {
-                                let format_str = "input_%Y%m%d_%H%M%S.yaml";
-                                let stamped = debug_image_stamp.format(format_str).to_string();
-
-                                let debug_path = std::path::PathBuf::from(debug_dir);
-                                let yaml_path = debug_path.join(stamped);
-
-                                let f = File::create(&yaml_path).expect("create file");
-
-                                #[derive(Serialize)]
-                                struct CornerData<'a> {
-                                    corners: &'a Option<Vec<(f32, f32)>>,
-                                    work_duration: std::time::Duration,
+                                    if let Some(ref ssa) = shared_store_arc {
+                                        // scope for write lock on ssa
+                                        let mut tracker = ssa.write().unwrap();
+                                        tracker.modify(|shared| {
+                                            shared.checkerboard_data.num_checkerboards_collected =
+                                                num_checkerboards_collected;
+                                        });
+                                    }
                                 }
-                                let debug_data = CornerData {
-                                    corners: &corners,
-                                    work_duration,
-                                };
-
-                                serde_yaml::to_writer(f, &debug_data)
-                                    .expect("serde_yaml::to_writer");
-                            }
-
-                            if let Some(corners) = corners {
-                                info!(
-                                    "Found {} chessboard corners in {} msec.",
-                                    corners.len(),
-                                    work_duration.as_millis()
-                                );
-                                results = corners
-                                    .iter()
-                                    .map(|(x, y)| video_streaming::Point {
-                                        x: *x,
-                                        y: *y,
-                                        theta: None,
-                                        area: None,
-                                    })
-                                    .collect();
-
-                                let num_checkerboards_collected = {
-                                    let mut collected_corners =
-                                        collected_corners_arc.write().unwrap();
-                                    collected_corners.push(corners);
-                                    collected_corners.len().try_into().unwrap()
-                                };
-
-                                if let Some(ref ssa) = shared_store_arc {
-                                    // scope for write lock on ssa
-                                    let mut tracker = ssa.write().unwrap();
-                                    tracker.modify(|shared| {
-                                        shared.checkerboard_data.num_checkerboards_collected =
-                                            num_checkerboards_collected;
-                                    });
+                                None => {
+                                    checkerboard_overlay_points.clear();
                                 }
-                            } else {
-                                info!(
-                                    "Found no chessboard corners in {} msec.",
-                                    work_duration.as_millis()
-                                );
                             }
                         }
-                    }
+
+                        // Do not submit a new job too often. If the worker is
+                        // still busy with a previous job, submitting here
+                        // simply replaces it in the mailbox -- only ever the
+                        // latest frame gets detected, so a slow detection
+                        // cannot cause a frame backlog.
+                        if last_checkerboard_detection.elapsed() > checkerboard_loop_dur {
+                            let job = CheckerboardJob {
+                                image: frame.image.clone(),
+                                pattern_width: checkerboard_data.width,
+                                pattern_height: checkerboard_data.height,
+                                debug_dir: checkerboard_save_debug,
+                            };
+                            // An error here means the worker task ended,
+                            // which only happens if this task is also
+                            // shutting down.
+                            let _ = checkerboard_job_tx.send(Some(job));
+                            last_checkerboard_detection = std::time::Instant::now();
+                        }
+
+                        checkerboard_overlay_points.clone()
+                    };
                     (results, None)
                 } else {
                     let mut all_points = Vec::new();
