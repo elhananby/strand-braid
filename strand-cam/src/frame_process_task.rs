@@ -102,22 +102,43 @@ fn run_checkerboard_job(job: CheckerboardJob) -> Result<CheckerboardJobResult> {
 
     let start_time = std::time::Instant::now();
     let frame_ref = job.image.borrow();
-    let corners = strand_dynamic_frame::match_all_dynamic_fmts!(
-        &frame_ref,
-        x,
-        {
-            let rgb: Box<dyn formats::ImageStride<formats::pixel_format::RGB8>> =
-                Box::new(convert_image::convert_ref::<_, formats::pixel_format::RGB8>(&x)?);
-            camcal::find_chessboard_corners(
-                rgb.image_data(),
-                rgb.width(),
-                rgb.height(),
-                job.pattern_width as usize,
-                job.pattern_height as usize,
-            )?
-        },
-        eyre::eyre!("unknown pixel format in checkerboard finder")
-    );
+    // Mono8 (the common case for machine-vision cameras) skips the RGB
+    // round trip entirely: `camcal::find_chessboard_corners` immediately
+    // converts its RGB input back to grayscale, so for a source that is
+    // already single-channel that conversion (and the replicate-to-RGB
+    // before it) is pure waste. Only take this path when the buffer is
+    // tightly packed (stride == width), since the gray-native entry point
+    // assumes no row padding; a padded Mono8 frame falls back to the
+    // general path below, which handles stride via `convert_image`.
+    use machine_vision_formats::ImageData;
+    let corners = if let Some(mono8) = frame_ref.as_static::<Mono8>()
+        && formats::Stride::stride(&mono8) == mono8.width() as usize
+    {
+        camcal::find_chessboard_corners_gray(
+            mono8.image_data(),
+            mono8.width(),
+            mono8.height(),
+            job.pattern_width as usize,
+            job.pattern_height as usize,
+        )?
+    } else {
+        strand_dynamic_frame::match_all_dynamic_fmts!(
+            &frame_ref,
+            x,
+            {
+                let rgb: Box<dyn formats::ImageStride<formats::pixel_format::RGB8>> =
+                    Box::new(convert_image::convert_ref::<_, formats::pixel_format::RGB8>(&x)?);
+                camcal::find_chessboard_corners(
+                    rgb.image_data(),
+                    rgb.width(),
+                    rgb.height(),
+                    job.pattern_width as usize,
+                    job.pattern_height as usize,
+                )?
+            },
+            eyre::eyre!("unknown pixel format in checkerboard finder")
+        )
+    };
     let work_duration = start_time.elapsed();
 
     debug!("corners: {:?}", corners);

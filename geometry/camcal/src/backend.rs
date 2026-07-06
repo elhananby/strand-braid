@@ -69,12 +69,28 @@ pub fn find_chessboard_corners(
     pattern_width: usize,
     pattern_height: usize,
 ) -> Result<Option<Vec<(f32, f32)>>, Error> {
+    let gray = rgb_to_gray(rgb, width, height);
+    find_chessboard_corners_gray(&gray, width, height, pattern_width, pattern_height)
+}
+
+/// Same as [`find_chessboard_corners`], but for callers that already have a
+/// grayscale buffer (e.g. a Mono8 camera frame). Skips the RGB round trip:
+/// [`find_chessboard_corners`] itself immediately converts its input to gray
+/// via [`rgb_to_gray`], so a caller whose source is already single-channel
+/// can hand it here directly instead of paying for a replicate-to-RGB step
+/// that would just get undone.
+pub fn find_chessboard_corners_gray(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+    pattern_width: usize,
+    pattern_height: usize,
+) -> Result<Option<Vec<(f32, f32)>>, Error> {
     use checkerboard_calibrate::{CornerSubPixParams, GrayImageRef, corner_subpix};
 
-    let gray = rgb_to_gray(rgb, width, height);
     let (w, h) = (width as usize, height as usize);
     let corners = checkerboard_calibrate::chessboard::find_chessboard_corners(
-        &gray,
+        gray,
         w,
         h,
         pattern_width,
@@ -83,7 +99,7 @@ pub fn find_chessboard_corners(
     // Sub-pixel refine before returning.
     Ok(corners.map(|raw| {
         corner_subpix(
-            GrayImageRef::new(&gray, w, h),
+            GrayImageRef::new(gray, w, h),
             &raw,
             &CornerSubPixParams::default(),
         )
