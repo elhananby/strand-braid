@@ -42,6 +42,11 @@ pub(crate) async fn run_cam_stream_task(
 ) -> Result<()> {
     let mut send_image_to_braid_timer = std::time::Instant::now();
     let mut send_image_to_braid_duration = std::time::Duration::from_millis(0);
+    // Rate-limit the "channel full" notice: during a sustained backlog every
+    // single frame hits this path, and logging plus taking the store write
+    // lock for each one adds needless overhead on top of the drop itself.
+    let mut last_frame_drop_notice: Option<std::time::Instant> = None;
+    const FRAME_DROP_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
     while let Some(frame_msg) = frame_stream.next().await {
         match &frame_msg {
             ci2_async::FrameResult::Frame(fframe) => {
@@ -75,26 +80,34 @@ pub(crate) async fn run_cam_stream_task(
                 }
 
                 if tx_frame.capacity() == 0 {
-                    let mut tracker = shared_store_arc.write().unwrap();
-                    tracker.modify(|tracker| {
-                        let mut state = frame_processing_error_state.write().unwrap();
-                        {
-                            match &*state {
-                                FrameProcessingErrorState::IgnoreAll => {}
-                                FrameProcessingErrorState::IgnoreUntil(ignore_until) => {
-                                    let now = chrono::Utc::now();
-                                    if now >= *ignore_until {
+                    let should_notify = last_frame_drop_notice
+                        .is_none_or(|t| t.elapsed() >= FRAME_DROP_NOTICE_INTERVAL);
+                    if should_notify {
+                        last_frame_drop_notice = Some(std::time::Instant::now());
+
+                        let mut tracker = shared_store_arc.write().unwrap();
+                        tracker.modify(|tracker| {
+                            let mut state = frame_processing_error_state.write().unwrap();
+                            {
+                                match &*state {
+                                    FrameProcessingErrorState::IgnoreAll => {}
+                                    FrameProcessingErrorState::IgnoreUntil(ignore_until) => {
+                                        let now = chrono::Utc::now();
+                                        if now >= *ignore_until {
+                                            tracker.had_frame_processing_error = true;
+                                            *state = FrameProcessingErrorState::NotifyAll;
+                                        }
+                                    }
+                                    FrameProcessingErrorState::NotifyAll => {
                                         tracker.had_frame_processing_error = true;
-                                        *state = FrameProcessingErrorState::NotifyAll;
                                     }
                                 }
-                                FrameProcessingErrorState::NotifyAll => {
-                                    tracker.had_frame_processing_error = true;
-                                }
                             }
-                        }
-                    });
-                    error!("Channel full sending frame to process thread. Dropping frame data.");
+                        });
+                        error!(
+                            "Channel full sending frame to process thread. Dropping frame data."
+                        );
+                    }
                 } else {
                     tx_frame
                         .send(Msg::Mframe(fframe.clone()))
