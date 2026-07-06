@@ -939,6 +939,7 @@ pub(crate) async fn frame_process_task<'a>(
                 let checkercal_tmp: Option<()> = None;
                 let (found_points, valid_display) = if let Some(inner) = checkercal_tmp {
                     #[cfg(not(feature = "checkercal"))]
+                    #[expect(clippy::let_unit_value)]
                     let results = {
                         let _ = inner;
                         Vec::new()

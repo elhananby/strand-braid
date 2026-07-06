@@ -731,104 +731,140 @@ where
                 #[cfg(feature = "checkercal")]
                 {
                     info!("computing calibration");
-                    let (n_rows, n_cols, checkerboard_save_debug) = {
-                        let tracker = shared_store_arc.read().unwrap();
-                        let shared = (*tracker).as_ref();
-                        let n_rows = shared.checkerboard_data.height;
-                        let n_cols = shared.checkerboard_data.width;
-                        let checkerboard_save_debug = shared.checkerboard_save_debug.clone();
-                        (n_rows, n_cols, checkerboard_save_debug)
-                    };
 
-                    let goodcorners: Vec<camcal::CheckerBoardData> = {
-                        let collected_corners = collected_corners_arc.read().unwrap();
-                        collected_corners
-                            .iter()
-                            .map(|corners| {
-                                let x: Vec<(f64, f64)> =
-                                    corners.iter().map(|x| (x.0 as f64, x.1 as f64)).collect();
-                                camcal::CheckerBoardData::new(n_rows as usize, n_cols as usize, &x)
-                            })
-                            .collect()
-                    };
+                    // The corner collection below is a fast, already-owned
+                    // snapshot, but the calibration refinement
+                    // (Levenberg-Marquardt over all collected boards) can
+                    // take a long time. Run the whole thing on a
+                    // blocking-pool thread so it cannot stall this command
+                    // loop -- and, in turn, the HTTP server and browser UI,
+                    // which run concurrently with it in the top-level
+                    // `select!`.
+                    let shared_store_arc2 = shared_store_arc.clone();
+                    let collected_corners_arc2 = collected_corners_arc.clone();
+                    let cam_name3 = cam_name2.clone();
+                    let raw_cam_name2 = raw_cam_name.clone();
 
-                    let local: chrono::DateTime<chrono::Local> = chrono::Local::now();
-
-                    if let Some(debug_dir) = &checkerboard_save_debug {
-                        let format_str = format!(
-                            "checkerboard_input_{}.%Y%m%d_%H%M%S.yaml",
-                            cam_name2.as_str()
-                        );
-                        let stamped = local.format(&format_str).to_string();
-
-                        let debug_path = std::path::PathBuf::from(debug_dir);
-                        let corners_path = debug_path.join(stamped);
-
-                        let f = File::create(&corners_path).expect("create file");
-
-                        #[derive(Serialize)]
-                        struct CornersData<'a> {
-                            corners: &'a Vec<camcal::CheckerBoardData>,
-                            image_width: u32,
-                            image_height: u32,
-                        }
-                        let debug_data = CornersData {
-                            corners: &goodcorners,
-                            image_width,
-                            image_height,
+                    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                        let (n_rows, n_cols, checkerboard_save_debug) = {
+                            let tracker = shared_store_arc2.read().unwrap();
+                            let shared = (*tracker).as_ref();
+                            let n_rows = shared.checkerboard_data.height;
+                            let n_cols = shared.checkerboard_data.width;
+                            let checkerboard_save_debug = shared.checkerboard_save_debug.clone();
+                            (n_rows, n_cols, checkerboard_save_debug)
                         };
-                        serde_yaml::to_writer(f, &debug_data).expect("serde_yaml::to_writer");
-                    }
 
-                    let size = camcal::PixelSize::new(image_width as usize, image_height as usize);
+                        let goodcorners: Vec<camcal::CheckerBoardData> = {
+                            let collected_corners = collected_corners_arc2.read().unwrap();
+                            collected_corners
+                                .iter()
+                                .map(|corners| {
+                                    let x: Vec<(f64, f64)> =
+                                        corners.iter().map(|x| (x.0 as f64, x.1 as f64)).collect();
+                                    camcal::CheckerBoardData::new(
+                                        n_rows as usize,
+                                        n_cols as usize,
+                                        &x,
+                                    )
+                                })
+                                .collect()
+                        };
 
-                    match camcal::compute_intrinsics_with_raw_opencv::<f64>(size, &goodcorners) {
-                        Ok(raw_opencv_cal) => {
-                            let cal_dir = directories::BaseDirs::new()
-                                .as_ref()
-                                .map(|bd| bd.config_dir().join(APP_INFO.name).join("camera_info"))
-                                .unwrap();
+                        let local: chrono::DateTime<chrono::Local> = chrono::Local::now();
 
-                            if !cal_dir.exists() {
-                                std::fs::create_dir_all(&cal_dir)?;
-                            }
-
-                            info!("Using calibration directory at \"{}\"", cal_dir.display());
-
-                            let format_str =
-                                format!("{}.%Y%m%d_%H%M%S.yaml", raw_cam_name.as_str());
-                            let stamped = local.format(&format_str).to_string();
-                            let cam_info_file_stamped = cal_dir.join(stamped);
-
-                            let mut cam_info_file = cal_dir.clone();
-                            cam_info_file.push(raw_cam_name.as_str());
-                            cam_info_file.set_extension("yaml");
-
-                            // Save timestamped version first for backup purposes (since below
-                            // we overwrite the non-timestamped file).
-                            camcal::save_yaml(
-                                &cam_info_file_stamped,
-                                env!["CARGO_PKG_NAME"],
-                                local,
-                                &raw_opencv_cal,
-                                raw_cam_name.as_str(),
-                            )?;
-
-                            // Now copy the successfully saved file into
-                            // the non-timestamped name. This will
-                            // overwrite an existing file.
-                            std::fs::copy(&cam_info_file_stamped, &cam_info_file)
-                                .expect("copy file");
-
-                            info!(
-                                "Saved camera calibration to file: {}",
-                                cam_info_file.display(),
+                        if let Some(debug_dir) = &checkerboard_save_debug {
+                            let format_str = format!(
+                                "checkerboard_input_{}.%Y%m%d_%H%M%S.yaml",
+                                cam_name3.as_str()
                             );
+                            let stamped = local.format(&format_str).to_string();
+
+                            let debug_path = std::path::PathBuf::from(debug_dir);
+                            let corners_path = debug_path.join(stamped);
+
+                            let f = File::create(&corners_path).expect("create file");
+
+                            #[derive(Serialize)]
+                            struct CornersData<'a> {
+                                corners: &'a Vec<camcal::CheckerBoardData>,
+                                image_width: u32,
+                                image_height: u32,
+                            }
+                            let debug_data = CornersData {
+                                corners: &goodcorners,
+                                image_width,
+                                image_height,
+                            };
+                            serde_yaml::to_writer(f, &debug_data).expect("serde_yaml::to_writer");
                         }
+
+                        let size =
+                            camcal::PixelSize::new(image_width as usize, image_height as usize);
+
+                        match camcal::compute_intrinsics_with_raw_opencv::<f64>(size, &goodcorners)
+                        {
+                            Ok(raw_opencv_cal) => {
+                                let cal_dir = directories::BaseDirs::new()
+                                    .as_ref()
+                                    .map(|bd| {
+                                        bd.config_dir().join(APP_INFO.name).join("camera_info")
+                                    })
+                                    .unwrap();
+
+                                if !cal_dir.exists() {
+                                    std::fs::create_dir_all(&cal_dir)?;
+                                }
+
+                                info!("Using calibration directory at \"{}\"", cal_dir.display());
+
+                                let format_str =
+                                    format!("{}.%Y%m%d_%H%M%S.yaml", raw_cam_name2.as_str());
+                                let stamped = local.format(&format_str).to_string();
+                                let cam_info_file_stamped = cal_dir.join(stamped);
+
+                                let mut cam_info_file = cal_dir.clone();
+                                cam_info_file.push(raw_cam_name2.as_str());
+                                cam_info_file.set_extension("yaml");
+
+                                // Save timestamped version first for backup purposes (since below
+                                // we overwrite the non-timestamped file).
+                                camcal::save_yaml(
+                                    &cam_info_file_stamped,
+                                    env!["CARGO_PKG_NAME"],
+                                    local,
+                                    &raw_opencv_cal,
+                                    raw_cam_name2.as_str(),
+                                )?;
+
+                                // Now copy the successfully saved file into
+                                // the non-timestamped name. This will
+                                // overwrite an existing file.
+                                std::fs::copy(&cam_info_file_stamped, &cam_info_file)
+                                    .expect("copy file");
+
+                                info!(
+                                    "Saved camera calibration to file: {}",
+                                    cam_info_file.display(),
+                                );
+                            }
+                            Err(e) => {
+                                error!("failed doing calibration {:?} {}", e, e);
+                            }
+                        };
+                        Ok(())
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(e),
                         Err(e) => {
-                            error!("failed doing calibration {:?} {}", e, e);
+                            return Err(eyre::eyre!(
+                                "checkerboard calibration worker panicked: {e}"
+                            ));
                         }
-                    };
+                    }
                 }
             }
         }
