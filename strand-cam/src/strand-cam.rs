@@ -1576,6 +1576,15 @@ where
             let pixfmt = PixFmt::from_str(pixfmt_str).map_err(|e: &str| eyre!(e.to_string()))?;
             info!("  setting pixel format: {}", pixfmt);
             cam.set_pixel_format(pixfmt)?;
+        } else if cam.pixel_format().is_err() {
+            // The camera's persistent pixel format from a previous session is
+            // not one strand-cam understands (e.g. Mono12). Switch to Mono8 so
+            // acquisition can proceed. Pass --pixel-format to choose explicitly.
+            tracing::warn!(
+                "Camera pixel format is not supported by strand-cam; \
+                 switching to Mono8. Use --pixel-format to choose a different format."
+            );
+            cam.set_pixel_format(PixFmt::Mono8)?;
         }
 
         debug!("  current pixel format: {}", cam.pixel_format()?);
