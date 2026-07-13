@@ -61,7 +61,6 @@ struct CheckerboardJob {
 #[cfg(feature = "checkercal")]
 struct CheckerboardJobResult {
     corners: Option<Vec<(f32, f32)>>,
-    work_duration: std::time::Duration,
 }
 
 /// Detect a chessboard in `job.image` (and, if configured, save debug
@@ -176,10 +175,7 @@ fn run_checkerboard_job(job: CheckerboardJob) -> Result<CheckerboardJobResult> {
         );
     }
 
-    Ok(CheckerboardJobResult {
-        corners,
-        work_duration,
-    })
+    Ok(CheckerboardJobResult { corners })
 }
 
 /// Perform image analysis
@@ -358,20 +354,6 @@ pub(crate) async fn frame_process_task<'a>(
     let april_tf = make_family(&current_tag_family);
     #[cfg(feature = "fiducial")]
     april_td.add_family(april_tf);
-
-    #[cfg(feature = "checkercal")]
-    let mut last_checkerboard_detection = std::time::Instant::now();
-
-    // This limits the frequency at which we *submit* a checkerboard detection
-    // job (mostly to avoid encoding/cloning a frame more often than the
-    // detector could possibly keep up with). Detection itself always runs on
-    // a blocking-pool thread via the mailbox set up below, so a slow
-    // detection -- even one taking tens of seconds -- can no longer stall
-    // this loop, the HTTP server, or the browser UI; it can only make the
-    // corner overlay lag behind the live video. This duration is adapted
-    // upward whenever a completed job took longer than the current interval.
-    #[cfg(feature = "checkercal")]
-    let mut checkerboard_loop_dur = std::time::Duration::from_millis(500);
 
     // The most recently detected corners, shown as the overlay until a new
     // detection completes (or comes back empty).
@@ -974,10 +956,6 @@ pub(crate) async fn frame_process_task<'a>(
                         // on a separate blocking-pool thread) and update the
                         // persisted overlay + collected corners.
                         while let Ok(result) = checkerboard_result_rx.try_recv() {
-                            if result.work_duration > checkerboard_loop_dur {
-                                checkerboard_loop_dur =
-                                    result.work_duration + std::time::Duration::from_millis(5);
-                            }
                             match result.corners {
                                 Some(corners) => {
                                     checkerboard_overlay_points = corners
@@ -1012,24 +990,21 @@ pub(crate) async fn frame_process_task<'a>(
                             }
                         }
 
-                        // Do not submit a new job too often. If the worker is
-                        // still busy with a previous job, submitting here
-                        // simply replaces it in the mailbox -- only ever the
-                        // latest frame gets detected, so a slow detection
-                        // cannot cause a frame backlog.
-                        if last_checkerboard_detection.elapsed() > checkerboard_loop_dur {
-                            let job = CheckerboardJob {
-                                image: frame.image.clone(),
-                                pattern_width: checkerboard_data.width,
-                                pattern_height: checkerboard_data.height,
-                                debug_dir: checkerboard_save_debug,
-                            };
-                            // An error here means the worker task ended,
-                            // which only happens if this task is also
-                            // shutting down.
-                            let _ = checkerboard_job_tx.send(Some(job));
-                            last_checkerboard_detection = std::time::Instant::now();
-                        }
+                        // Submit every frame as the next detection job. The
+                        // watch-channel mailbox keeps only the latest value,
+                        // so a busy worker simply picks up the most recent
+                        // frame once it finishes -- no stale frames can queue
+                        // up and no clone cost grows with detection latency
+                        // (Arc clone is just a refcount increment).
+                        let job = CheckerboardJob {
+                            image: frame.image.clone(),
+                            pattern_width: checkerboard_data.width,
+                            pattern_height: checkerboard_data.height,
+                            debug_dir: checkerboard_save_debug,
+                        };
+                        // An error here means the worker task ended, which
+                        // only happens if this task is also shutting down.
+                        let _ = checkerboard_job_tx.send(Some(job));
 
                         checkerboard_overlay_points.clone()
                     };
